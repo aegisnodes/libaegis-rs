@@ -44,7 +44,9 @@ pub trait ComponentHandler: Send + Sync + 'static {
     /// per-run state in `on_reborn`.
     fn on_running(
         &self,
-        shutdown: CancellationToken,
+        component_id: String,
+        session_id:   String,
+        shutdown:     CancellationToken,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
@@ -226,9 +228,10 @@ impl<H: ComponentHandler> Component<H> {
         }
 
         payload.insert("capabilities".into(), serde_json::json!({
-            "supported_symbols":    self.cfg.supported_symbols,
-            "supported_timeframes": self.cfg.supported_timeframes,
-            "requires_streams":     self.cfg.requires_streams,
+            "supported_symbols":          self.cfg.supported_symbols,
+            "supported_timeframes":       self.cfg.supported_timeframes,
+            "supported_orderbook_speeds": self.cfg.supported_orderbook_speeds,
+            "requires_streams":           self.cfg.requires_streams,
         }));
 
         let env = Envelope::new(
@@ -386,9 +389,11 @@ impl<H: ComponentHandler> Component<H> {
 
         info!("Component is now RUNNING");
 
-        let handler = Arc::clone(&self.handler);
+        let handler      = Arc::clone(&self.handler);
+        let component_id = self.component_id.lock().await.clone();
+        let session_id   = self.session_id.lock().await.clone();
         tokio::spawn(async move {
-            if let Err(e) = handler.on_running(shutdown_token).await {
+            if let Err(e) = handler.on_running(component_id, session_id, shutdown_token).await {
                 error!("on_running error: {}", e);
             }
         });

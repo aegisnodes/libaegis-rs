@@ -1,8 +1,8 @@
-//! Basic example: a component that connects to Aegis, receives market data,
-//! and resets cleanly on session restart (REBORN).
+//! Basic example: a component that connects to Aegis, receives realtime
+//! market data, and resets cleanly on session restart (REBORN).
 
 use libaegis::{Component, ComponentHandler, Config, DataStream, StreamMessage};
-use libaegis::data_stream::MarketData;
+use libaegis::data_stream::{MarketData, OrderBook};
 use libaegis::error::Result;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -33,8 +33,8 @@ impl ComponentHandler for MarketDataHandler {
         Ok(())
     }
 
-    // component_id and session_id come directly from the SDK (populated from
-    // the REGISTERED response) — no need to store or seed them manually.
+    // component_id and session_id are now passed directly by the SDK —
+    // no need to store them manually or read from env vars.
     async fn on_running(
         &self,
         component_id: String,
@@ -53,10 +53,6 @@ impl ComponentHandler for MarketDataHandler {
     }
 
     async fn on_reborn(&self) {
-        // Called when Aegis restarts the session (REBORN command).
-        // Reset ALL state from the previous run here — counters, positions,
-        // buffers, etc. on_running is NOT called again; the existing worker
-        // task keeps running and will receive data from the new orchestrator.
         info!("reborn — resetting per-run state");
     }
 
@@ -111,6 +107,7 @@ async fn stream_worker(
                     match result {
                         Ok((msg, data)) => handle_message(msg, data).await,
                         Err(e) => {
+                            tracing::warn!("next_parsed error: {e}");
                             tracing::warn!("data stream closed: {e} — reconnecting");
                             break;
                         }
@@ -179,29 +176,27 @@ async fn handle_message(msg: StreamMessage, data: MarketData) {
             );
         }
 
+        MarketData::OrderBook(ob) => {
+            handle_order_book(&parts.symbol, msg.ts, ob);
+        }
+
         MarketData::BookDepth(bd) => {
-            info!(
+            tracing::info!(
                 symbol     = %parts.symbol,
                 ts         = bd.timestamp,
                 percentage = bd.percentage,
                 depth      = bd.depth,
-                "bookDepth",
+                "bookDepth (historical)",
             );
         }
 
         MarketData::Metrics(m) => {
-            info!(
+            tracing::info!(
                 symbol = %parts.symbol,
                 ts     = m.create_time,
                 oi     = m.sum_open_interest,
-                "metrics",
+                "metrics (historical)",
             );
-        }
-
-        // orderBook is realtime-only — won't arrive in a historical session,
-        // but the match must be exhaustive.
-        MarketData::OrderBook(_) => {
-            tracing::debug!(topic = %msg.topic, "orderBook (unexpected in historical mode)");
         }
 
         MarketData::Unknown { data_type, .. } => {
@@ -214,6 +209,37 @@ async fn handle_message(msg: StreamMessage, data: MarketData) {
     }
 }
 
+fn handle_order_book(symbol: &str, envelope_ts: i64, ob: OrderBook) {
+    if !ob.has_real_timestamp() {
+        tracing::debug!(
+            symbol         = symbol,
+            last_update_id = ob.last_update_id,
+            "orderBook — spot stream (no real timestamp)",
+        );
+    }
+
+    match (ob.best_bid(), ob.best_ask()) {
+        (Some(bid), Some(ask)) => {
+            let spread = ask.price - bid.price;
+            let mid    = ob.mid_price().unwrap_or(0.0);
+            info!(
+                symbol    = symbol,
+                ts        = envelope_ts,
+                bid       = bid.price,
+                ask       = ask.price,
+                spread    = spread,
+                mid_price = mid,
+                bid_depth = ob.bids.len(),
+                ask_depth = ob.asks.len(),
+                "orderBook",
+            );
+        }
+        _ => {
+            tracing::warn!(symbol = symbol, "orderBook snapshot has empty bids or asks");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -221,7 +247,7 @@ async fn handle_message(msg: StreamMessage, data: MarketData) {
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter("libaegis=debug,market_data=info")
+        .with_env_filter("libaegis=debug,realtime=info")
         .init();
 
     let socket_path   = std::env::var("AEGIS_SOCKET")
@@ -229,12 +255,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let session_token = std::env::var("AEGIS_SESSION_TOKEN")
         .unwrap_or_default();
 
-    let mut cfg = Config::new(socket_path, session_token, "market_data");
-    cfg.version              = "0.1.0".into();
-    cfg.supported_symbols    = vec!["BTCUSDT".into(), "ETHUSDT".into()];
-    cfg.supported_timeframes = vec!["1m".into(), "5m".into()];
-    cfg.requires_streams     = vec!["aggTrades".into(), "klines".into()];
-    cfg.max_reconnect_attempts = 10;
+    let mut cfg = Config::new(socket_path, session_token, "realtime");
+    cfg.version                    = "0.1.0".into();
+    cfg.supported_symbols          = vec!["BTCUSDT".into()];
+    cfg.supported_timeframes       = vec!["1m".into(), "5m".into()];
+    cfg.requires_streams           = vec!["aggTrades".into(), "klines".into(), "orderBook".into()];
+    cfg.supported_orderbook_speeds = vec!["100ms".into()];
+    cfg.max_reconnect_attempts     = 10;
 
     let component = Component::new(cfg, MarketDataHandler::new());
 
